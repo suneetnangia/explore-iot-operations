@@ -148,10 +148,10 @@ fn tls_context(
 /// Parse an HTTP request and authenticate the connecting client.
 async fn process_req(
     req: http::HttpRequest,
-) -> Result<http::HttpResponse, std::convert::Infallible> {
+) -> Result<http::HttpResponse> {
     let req = match http::ParsedRequest::from_http(req).await {
         Ok(req) => req,
-        Err(response) => return Ok(response.to_http()),
+        Err(response) => return Ok(response.to_http()?),
     };
 
     // TODO: Review this debug statement from SFI perspective.
@@ -159,7 +159,7 @@ async fn process_req(
     // it may print sensitive data.
     debug!("{req:?}");
 
-    let response = authenticate::authenticate(req).await;
+    let response = authenticate::authenticate(req).await?;
 
-    Ok(response.to_http())
+    Ok(response.to_http()?)
 }

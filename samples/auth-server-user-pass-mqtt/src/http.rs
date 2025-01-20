@@ -1,15 +1,21 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use anyhow::Result;
+use http_body_util::{BodyExt, Full};
+use hyper::{body::Bytes, header, Method, StatusCode};
+use log::{info, trace};
 use std::{
     collections::HashMap,
     fmt::{Debug, Display, Formatter, Result as FmtResult},
 };
-use http_body_util::{BodyExt, Full};
-use hyper::{body::Bytes, header, Method, StatusCode};
 
 pub(crate) type HttpRequest = hyper::Request<hyper::body::Incoming>;
 pub(crate) type HttpResponse = hyper::Response<Full<Bytes>>;
+
+// TODO: Can these moved to their own module?
+pub(crate) const HTTP_MIME_APPLICATION_JSON: &str = "application/json";
+pub(crate) const API_SUPPORTED_VERSION: &str = "0.5.0";
 
 pub(crate) struct ParsedRequest {
     pub method: Method,
@@ -28,7 +34,7 @@ impl ParsedRequest {
         let version = format!("{:?}", req.version());
 
         let mut query = HashMap::new();
-        if let Some(q) = uri.query() {
+        if let Some(q) = req.uri().query() {
             let parts: Vec<&str> = q.split('&').collect();
 
             for p in parts {
@@ -79,6 +85,7 @@ impl ParsedRequest {
     }
 }
 
+// TODO: Can this be improved?
 impl Debug for ParsedRequest {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "\n----\n")?;
@@ -102,7 +109,6 @@ impl Debug for ParsedRequest {
 
 pub(crate) enum Response {
     Error { status: StatusCode, message: String },
-
     Json { status: StatusCode, body: String },
 }
 
@@ -128,46 +134,33 @@ impl Response {
         }
     }
 
-    pub fn json(status: StatusCode, body: impl serde::Serialize) -> Self {
-        let body = serde_json::to_string(&body).unwrap();
-
-        Response::Json { status, body }
+    pub fn json(status: StatusCode, body: impl serde::Serialize) -> Result<Self> {
+        let body = serde_json::to_string(&body)?;
+        Ok(Response::Json { status, body })
     }
 
-    #[allow(clippy::wrong_self_convention)] // This function should consume self.
-    pub fn to_http(self) -> HttpResponse {
+    pub fn to_http(self) -> Result<HttpResponse> {
         let mut response = hyper::Response::builder();
 
-        let (status, body, debug_body) = match self {
+        let (status, body) = match self {
             Response::Error { status, message } => {
-                println!();
-                println!("{message}");
-
-                (status, Bytes::from(message), None)
+                info!("{status}, {message}");
+                (status, Bytes::from(message))
             }
-
             Response::Json { status, body } => {
-                response = response.header(header::CONTENT_TYPE, "application/json");
+                response = response.header(header::CONTENT_TYPE, HTTP_MIME_APPLICATION_JSON);
 
-                (status, Bytes::from(body.clone()), Some(body))
+                trace!("{status}, {body}");
+                (status, Bytes::from(body.clone()))
             }
         };
 
-        println!();
-        println!("< {status}");
-
         let body = Full::new(body);
-        let response = response.status(status).body(body).unwrap();
-
+        let response = response.status(status).body(body)?;
         for (key, value) in response.headers() {
-            println!("< {}: {}", key, value.to_str().unwrap());
+            trace!("{}: {}", key, value.to_str()?);
         }
 
-        if let Some(body) = debug_body {
-            println!();
-            println!("{body}");
-        }
-
-        response
+        Ok(response)
     }
 }

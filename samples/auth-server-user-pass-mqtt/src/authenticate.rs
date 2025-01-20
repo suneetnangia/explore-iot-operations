@@ -1,10 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::collections::BTreeMap;
+use crate::http::{ParsedRequest, Response, API_SUPPORTED_VERSION, HTTP_MIME_APPLICATION_JSON};
+use anyhow::Result;
 use hyper::{header, Method, StatusCode};
+use log::trace;
 use openssl::x509::X509;
-use crate::http::{ParsedRequest, Response};
+use std::collections::HashMap;
 
 /// Returned when the client requests an invalid API version. Contains a list of
 /// supported API versions.
@@ -18,50 +20,68 @@ struct SupportedApiVersions {
 impl Default for SupportedApiVersions {
     fn default() -> Self {
         SupportedApiVersions {
-            supported_versions: vec!["0.5.0".to_string()],
+            supported_versions: vec![API_SUPPORTED_VERSION.to_string()],
         }
     }
 }
 
 /// Authenticate the connecting MQTT client.
-pub(crate) async fn authenticate(req: ParsedRequest) -> Response {
+pub(crate) async fn authenticate(req: ParsedRequest) -> Result<Response> {
     // Check that the request follows the authentication spec.
     if req.method != Method::POST {
-        return Response::method_not_allowed(&req.method);
+        return Ok(Response::method_not_allowed(&req.method));
     }
 
     if let Some(content_type) = req.headers.get(header::CONTENT_TYPE.as_str()) {
-        if content_type.to_lowercase() != "application/json" {
-            return Response::bad_request(format!("invalid content-type: {content_type}"));
+        if content_type.to_lowercase() != HTTP_MIME_APPLICATION_JSON {
+            return Ok(Response::bad_request(format!(
+                "invalid content-type: {content_type}"
+            )));
         }
     }
 
     let Some(body) = req.body else {
-        return Response::bad_request("missing body");
+        return Ok(Response::bad_request("missing body"));
     };
 
     if req.path != "/" {
-        return Response::not_found(format!("{} not found", req.path));
+        return Ok(Response::not_found(format!("{} not found", req.path)));
     }
 
     if let Some(api_version) = req.query.get("api-version") {
         // Currently, the custom auth API supports only version 0.5.0.
-        if api_version != "0.5.0" {
+        if api_version != API_SUPPORTED_VERSION {
             return Response::json(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 SupportedApiVersions::default(),
             );
         }
     } else {
-        return Response::bad_request("missing api-version");
+        return Ok(Response::bad_request("missing api-version"));
     }
 
     let body: ClientAuthRequest = match serde_json::from_str(&body) {
         Ok(body) => body,
-        Err(err) => return Response::bad_request(format!("invalid client request body: {err}")),
+        Err(err) => {
+            return Ok(Response::bad_request(format!(
+                "invalid client request body: {err}"
+            )))
+        }
     };
 
-    Response::from(auth_client(body).await)
+    let auth_response = auth_client(body).await?;
+
+    let response = match auth_response {
+        ClientAuthResponse::Allow(response) => Response::json(StatusCode::OK, response).expect("Failed to create response"),
+        ClientAuthResponse::Deny { reason } => {
+            let body = serde_json::json!({
+                "reason": reason,
+            });
+            Response::json(StatusCode::FORBIDDEN, body).expect("Failed to create response")
+        }
+    };
+
+    Ok(response)
 }
 
 /// MQTT client authentication request. Contains the information from either a CONNECT
@@ -142,30 +162,12 @@ struct AuthPassResponse {
     expiry: Option<String>,
 
     /// The client's authorization attributes.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    attributes: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    attributes: HashMap<String, String>,
 }
 
-impl From<ClientAuthResponse> for Response {
-    fn from(response: ClientAuthResponse) -> Response {
-        match response {
-            ClientAuthResponse::Allow(response) => Response::json(StatusCode::OK, response),
-
-            ClientAuthResponse::Deny { reason } => {
-                let body = serde_json::json!({
-                    "reason": reason,
-                });
-
-                Response::json(StatusCode::FORBIDDEN, body)
-            }
-        }
-    }
-}
-
-// This implementation is a placeholder. The actual implementation may need to be async, so allow unused async
-// in the signature.
-#[allow(clippy::unused_async)]
-async fn auth_client(body: ClientAuthRequest) -> ClientAuthResponse {
+/// Authenticate the client based on the provided credentials.
+async fn auth_client(body: ClientAuthRequest) -> Result<ClientAuthResponse> {
     match body {
         ClientAuthRequest::Connect {
             username,
@@ -173,22 +175,23 @@ async fn auth_client(body: ClientAuthRequest) -> ClientAuthResponse {
             certs,
             enhanced_authentication,
         } => {
-            // TODO: Authenticate the client with provided credentials. For now, this template just logs the
-            // credentials. Note that password and enhanced authentication data are base64-encoded.
-            println!("Got MQTT CONNECT; username: {username:?}, password: {password:?}, enhancedAuthentication: {enhanced_authentication:?}");
+            // Note that password and enhanced authentication data are base64-encoded.
+            trace!("Received MQTT CONNECT; username: {username:?}, password: {password:?}, enhancedAuthentication: {enhanced_authentication:?}");
 
-            // TODO: Authenticate the client with provided certs. For now, this template just logs the certs.
+            // TODO: Authenticate the client with provided certs. For now, this just logs the certs.
             if let Some(certs) = certs {
-                println!("Got certs:");
-                println!("{certs:#?}");
+                trace!("Client certs found: {certs:#?}");
             }
 
             // TODO: Get attributes associated with the presented certificate. For now, this template
             // just provides hardcoded example values.
-            let mut example_attributes = BTreeMap::new();
+            let mut example_attributes = HashMap::new();
             example_attributes.insert("example_key".to_string(), "example_value".to_string());
 
-            authentication_example(username.as_deref(), example_attributes)
+            Ok(authentication_example(
+                username.as_deref(),
+                example_attributes,
+            ))
         }
 
         ClientAuthRequest::Auth {
@@ -210,14 +213,14 @@ async fn auth_client(body: ClientAuthRequest) -> ClientAuthResponse {
                     // unused field warning.
                     let _ = enhanced_authentication.data;
 
-                    authentication_example(Some(username), BTreeMap::new())
+                    Ok(authentication_example(Some(username), HashMap::new()))
                 } else {
-                    ClientAuthResponse::Deny { reason: 135 }
+                    Ok(ClientAuthResponse::Deny { reason: 135 })
                 }
             } else {
                 println!("Failed to decode enhanced authentication method");
 
-                ClientAuthResponse::Deny { reason: 135 }
+                Ok(ClientAuthResponse::Deny { reason: 135 })
             }
         }
     }
@@ -225,7 +228,7 @@ async fn auth_client(body: ClientAuthRequest) -> ClientAuthResponse {
 
 fn authentication_example(
     username: Option<&str>,
-    attributes: BTreeMap<String, String>,
+    attributes: HashMap<String, String>,
 ) -> ClientAuthResponse {
     // TODO: Determine when the client's credentials should expire. For now, this template sets
     // an expiry of 10 seconds if the username starts with 'expire'; otherwise, it does not set
